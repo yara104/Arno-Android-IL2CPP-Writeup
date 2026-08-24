@@ -77,6 +77,10 @@ global-metadata.dat
 
 These two files are important for analyzing a Unity IL2CPP application.
 
+### APK Analysis
+
+![APK Analysis](screenshots/apk-analysis.png)
+
 ---
 
 # 2. IL2CPP Dumping
@@ -104,6 +108,10 @@ The `DummyDll` directory contained:
 ```text
 Assembly-CSharp.dll
 ```
+
+### Il2CppDumper
+
+![Il2CppDumper](screenshots/il2cpp-dumper.png)
 
 ---
 
@@ -135,6 +143,12 @@ GetFlag     RVA = 0x16D1918
 DecryptFlag RVA = 0x16D1988
 ```
 
+### FlagControl Class
+
+![FlagControl](screenshots/flagcontrol.png)
+
+These methods were interesting because they provided direct access to the encryption key, IV, encrypted flag, and decryption function.
+
 ---
 
 # 4. Getting the Runtime Base Address
@@ -147,15 +161,20 @@ I used Frida to find the loaded `libil2cpp.so` module:
 Process.findModuleByName("libil2cpp.so")
 ```
 
-Frida returned the module information, including its base address.
+Frida returned information about the loaded module, including its base address.
 
 For example:
 
 ```text
 base: 0x71d8000
+name: libil2cpp.so
 ```
 
-The base address can change between application runs because of ASLR, so I used the current base address instead of hardcoding it.
+The base address can change between application runs because of ASLR, so I used the current base address from the running process.
+
+### Frida Base Address
+
+![Frida Base Address](screenshots/frida-base.png)
 
 ---
 
@@ -167,7 +186,16 @@ The runtime address can be calculated as:
 Runtime Address = Module Base + RVA
 ```
 
-I used Frida to calculate the addresses:
+The RVAs found during static analysis were:
+
+```text
+GetKey      RVA = 0x16D1838
+GetIV       RVA = 0x16D18A8
+GetFlag     RVA = 0x16D1918
+DecryptFlag RVA = 0x16D1988
+```
+
+I used Frida to calculate the runtime addresses:
 
 ```javascript
 const lib = Process.findModuleByName("libil2cpp.so");
@@ -184,25 +212,39 @@ console.log("[+] GetFlag: " + getFlag);
 console.log("[+] DecryptFlag: " + decryptFlag);
 ```
 
-For example:
+For example, for `GetFlag()`:
 
 ```text
 0x71d8000 + 0x16D1918 = 0x88A9918
 ```
 
-The resulting address is the runtime address of `GetFlag()` for that process.
-
-The complete script is available here:
+So the runtime address of `GetFlag()` in this session was:
 
 ```text
-scripts/addresses.js
+0x88A9918
+```
+
+The important point is:
+
+```text
+RVA
+ ↓
+Static analysis
+
+Base Address
+ ↓
+Running process
+
+Base + RVA
+ ↓
+Runtime function address
 ```
 
 ---
 
 # 6. Extracting the Key, IV and Ciphertext
 
-After getting the runtime addresses, I used Frida's `NativeFunction` to call the IL2CPP methods directly.
+After calculating the runtime addresses, I used Frida's `NativeFunction` to call the IL2CPP methods directly.
 
 The important functions were:
 
@@ -212,15 +254,9 @@ GetIV()
 GetFlag()
 ```
 
-The script is available here:
+The returned values were managed byte arrays.
 
-```text
-scripts/extract.js
-```
-
-The returned values were byte arrays.
-
-The extracted data included:
+I extracted the following data:
 
 ```text
 KEY
@@ -228,7 +264,28 @@ IV
 CIPHERTEXT
 ```
 
-The ciphertext was 48 bytes long.
+The extracted values were:
+
+```text
+KEY length        = 32 bytes
+IV length         = 16 bytes
+CIPHERTEXT length = 48 bytes
+```
+
+### Extracted Data
+
+![Extracted Data](screenshots/extracted-data.png)
+
+The ciphertext obtained from `GetFlag()` was:
+
+```text
+13 eb f3 95 3a 9b 8c 13
+c6 e5 47 1f 7e ea a0 17
+4b 6c 1f ac 41 80 20 02
+da 16 eb 32 fa 88 f6 3c
+57 01 85 a8 bc 21 8d 9e
+f3 ac 03 e2 18 d3 0c 55
+```
 
 ---
 
@@ -250,6 +307,8 @@ I then used `hexdump()` to display the bytes.
 
 This allowed me to recover the encrypted flag data directly from the running application.
 
+The returned object contains metadata followed by the actual byte data, which is why the script reads the length and then reads the bytes from the array data area.
+
 ---
 
 # 8. AES-CBC Decryption
@@ -268,13 +327,7 @@ A 32-byte key means AES-256.
 
 I used Python and PyCryptodome to decrypt the ciphertext.
 
-The decryption script is available here:
-
-```text
-scripts/decrypt.py
-```
-
-The important part is:
+The important part of the Python script was:
 
 ```python
 from Crypto.Cipher import AES
@@ -289,6 +342,12 @@ plaintext = unpad(
 
 print(plaintext.decode())
 ```
+
+### Decryption
+
+![Decryption](screenshots/decryption.png)
+
+The ciphertext was decrypted successfully and the flag was recovered.
 
 ---
 
@@ -308,13 +367,14 @@ The main things I learned were:
 - How to use Frida `NativeFunction` to call native IL2CPP functions.
 - How to read returned byte arrays from memory.
 - How to extract encryption material from an application at runtime.
+- How to identify AES-CBC encryption.
 - How to decrypt AES-CBC encrypted data using Python.
 
 ---
 
 # 10. Final Workflow
 
-The complete attack/research flow was:
+The complete workflow was:
 
 ```text
 Decompile APK
@@ -345,7 +405,9 @@ Call functions with NativeFunction
       ↓
 Extract Key + IV + Ciphertext
       ↓
-AES-CBC decryption
+Identify AES-CBC
+      ↓
+Decrypt with Python
       ↓
 Recover the flag
 ```
@@ -356,9 +418,11 @@ Recover the flag
 
 This lab showed how static and dynamic analysis can be combined when analyzing a Unity IL2CPP Android application.
 
-Static analysis helped identify the interesting class and method RVAs, while Frida allowed me to interact with the native functions at runtime and extract the encrypted data.
+Static analysis helped identify the `FlagControl` class and the RVAs of its methods.
 
-Finally, the extracted key, IV and ciphertext were used to recover the flag with AES-CBC.
+Frida was then used to find the runtime base address of `libil2cpp.so` and calculate the runtime addresses of the target functions.
+
+Finally, I called the functions at runtime to extract the key, IV and ciphertext, and used Python to decrypt the ciphertext with AES-CBC.
 
 ```text
 Static Analysis
@@ -368,4 +432,27 @@ Dynamic Analysis
 Cryptographic Analysis
       =
 Flag Recovery
+```
+
+---
+
+## Repository Structure
+
+```text
+Arno-IL2CPP-Reverse-Engineering/
+│
+├── README.md
+│
+├── scripts/
+│   ├── addresses.js
+│   ├── extract.js
+│   └── decrypt.py
+│
+└── screenshots/
+    ├── apk-analysis.png
+    ├── il2cpp-dumper.png
+    ├── flagcontrol.png
+    ├── frida-base.png
+    ├── extracted-data.png
+    └── decryption.png
 ```
